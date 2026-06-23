@@ -86,6 +86,8 @@ The instrumented version of this file (`openai_agent_sdk_realtime.py`) sends Gen
 uv add opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 ```
 
+> The audio instrumentation uses only Python standard library modules (`wave`, `io`, `base64`) — no additional packages required.
+
 ### Configure
 
 Add your Datadog API key to `.env`:
@@ -109,6 +111,15 @@ Three things are instrumented in `handle_events()`:
 > **Important:** All user utterances for a turn must be batched into **one** `add_event` call. Calling `add_event` with `gen_ai.input.messages` multiple times causes Datadog to string-concatenate the values, producing invalid JSON that falls back to raw text in the UI.
 
 **3. Token usage** — `data.type == "raw_server_event"` with `response.done` carries the token counts. It arrives before `agent_end`, so the values are available when the span closes.
+
+**4. Audio blobs** — Both sides of the conversation are captured as playable audio in Datadog:
+
+- **User input**: mic audio is buffered throughout each turn and attached as a WAV blob on the input message at `agent_end`
+- **Model output**: audio chunks from `event.type == "audio"` are accumulated and attached as a WAV blob on the output message at `agent_end`
+
+The raw PCM16 mono audio from the Realtime API is wrapped in a WAV container before encoding so the Datadog UI audio player can decode it. After the traces arrive, each turn's input and output messages will have a **Load Audio** button — click it to play back the audio for that turn.
+
+> **Note on turn-boundary audio capture**: mic audio is snapshotted at `agent_end` rather than `agent_start`. This avoids a race condition where chunks from the user's just-finished utterance could still be in flight when `agent_start` fires.
 
 ### Note on `event.type == "transcript_delta"`
 

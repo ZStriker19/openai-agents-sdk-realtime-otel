@@ -1,10 +1,13 @@
 import argparse
 import asyncio
+import base64
+import io
 import json
 import os
 import queue
 import threading
 import uuid
+import wave
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -24,7 +27,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 
 os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = "https://otlp.datadoghq.com/v1/traces"
-os.environ["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] = f"dd-api-key={os.getenv('DD_API_KEY')}"
+os.environ["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] = f"dd-api-key={os.getenv('DD_API_KEY')},dd-otlp-source=datadog"
 os.environ["OTEL_SEMCONV_STABILITY_OPT_IN"] = "gen_ai_latest_experimental"
 
 provider = TracerProvider(resource=Resource({SERVICE_NAME: "your-service-name"}))
@@ -138,6 +141,22 @@ MIC_METER_EVERY_N_CHUNKS = 5
 REALTIME_MODEL = "gpt-4o-realtime-preview"
 
 
+def _pcm_to_wav_blob(chunks: list[bytes]) -> dict:
+    """Wrap raw PCM16 mono 24kHz chunks in a WAV container and return an OTel blob part."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(24000)
+        wav_file.writeframes(b"".join(chunks))
+    return {
+        "type": "blob",
+        "modality": "audio",
+        "mime_type": "audio/wav",
+        "content": base64.b64encode(buf.getvalue()).decode(),
+    }
+
+
 async def main(*, input_device_index: int = 0, output_device_index: int = 1):
     p = pyaudio.PyAudio()
     mic = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
@@ -175,8 +194,11 @@ async def main(*, input_device_index: int = 0, output_device_index: int = 1):
     conversation_id = f"conv-{uuid.uuid4().hex[:12]}"
 
     current_turn_span = None
-    pending_input_transcripts = []  # user utterances buffered until agent_end
+    pending_input_transcripts = []   # user utterances buffered until agent_end
+    pending_input_audio_chunks = []  # mic audio since last turn ended
+    current_input_audio_chunks = []  # snapshotted at agent_end
     current_output_transcript = ""
+    current_output_audio_chunks = [] # model audio for this turn
     current_usage = {}
     # --------------------------------------------------------------------
 
@@ -196,17 +218,20 @@ async def main(*, input_device_index: int = 0, output_device_index: int = 1):
                         rms = np.sqrt(np.mean(audio_data**2))
                         meter = int(min(rms / 50, 50))
                         print(f"Mic Level: {'█' * meter}{' ' * (50-meter)} |", end="\r")
+                    pending_input_audio_chunks.append(raw_data)
                     await session.send_audio(raw_data)
             except Exception:
                 pass
 
         async def handle_events():
             nonlocal current_turn_span, pending_input_transcripts
-            nonlocal current_output_transcript, current_usage
+            nonlocal pending_input_audio_chunks, current_input_audio_chunks
+            nonlocal current_output_transcript, current_output_audio_chunks, current_usage
 
             async for event in session:
                 if event.type == "audio":
                     playback_queue.put_nowait(event.audio.data)
+                    current_output_audio_chunks.append(event.audio.data)
 
                 elif event.type == "audio_interrupted":
                     flush_playback()
@@ -215,6 +240,7 @@ async def main(*, input_device_index: int = 0, output_device_index: int = 1):
                 # --- Turn start: open a new root span -------------------
                 elif event.type == "agent_start":
                     current_output_transcript = ""
+                    current_output_audio_chunks = []
                     current_usage = {}
                     # Pass an empty context so this span has no parent —
                     # each turn is its own trace.
@@ -236,26 +262,39 @@ async def main(*, input_device_index: int = 0, output_device_index: int = 1):
                     if current_turn_span is None:
                         continue
 
-                    # Input: all user utterances from this turn as one event.
+                    # Snapshot mic audio at agent_end (not agent_start) so all
+                    # chunks from the user's utterance are guaranteed to be
+                    # appended before we read the list.
+                    current_input_audio_chunks = pending_input_audio_chunks
+                    pending_input_audio_chunks = []
+
+                    # Input: audio blob + transcript in one add_event call.
                     # Important: do NOT call add_event for input multiple times —
                     # Datadog concatenates duplicate keys, producing invalid JSON.
-                    if pending_input_transcripts:
+                    input_parts = []
+                    if current_input_audio_chunks:
+                        input_parts.append(_pcm_to_wav_blob(current_input_audio_chunks))
+                    for t in pending_input_transcripts:
+                        input_parts.append({"type": "text", "content": t})
+                    pending_input_transcripts = []
+                    if input_parts:
                         current_turn_span.add_event(
                             "gen_ai.client.inference.operation.details",
-                            {"gen_ai.input.messages": json.dumps([
-                                {"role": "user", "parts": [{"type": "text", "content": t}]}
-                                for t in pending_input_transcripts
-                            ])},
+                            {"gen_ai.input.messages": json.dumps([{"role": "user", "parts": input_parts}])},
                         )
-                        pending_input_transcripts = []
 
-                    # Output: full transcript assembled from deltas.
+                    # Output: transcript + audio blob in one add_event call.
+                    output_parts = []
                     if current_output_transcript:
+                        output_parts.append({"type": "text", "content": current_output_transcript})
+                    if current_output_audio_chunks:
+                        output_parts.append(_pcm_to_wav_blob(current_output_audio_chunks))
+                    if output_parts:
                         current_turn_span.add_event(
                             "gen_ai.client.inference.operation.details",
                             {"gen_ai.output.messages": json.dumps([{
                                 "role": "assistant",
-                                "parts": [{"type": "text", "content": current_output_transcript}],
+                                "parts": output_parts,
                                 "finish_reason": "stop",
                             }])},
                         )
