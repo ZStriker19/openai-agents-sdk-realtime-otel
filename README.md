@@ -98,7 +98,7 @@ provider = TracerProvider(resource=Resource({SERVICE_NAME: "your-service-name"})
 
 Replace `"your-service-name"` with whatever you want to appear as the service in Datadog (e.g. `"my-voice-agent"`). This is how your traces are grouped in the LLM Observability UI.
 
-The instrumentation reads `DD_API_KEY` from the environment and exports to `https://otlp.datadoghq.com/v1/traces` (US1). If you're on a different Datadog site (EU, US3, etc.), update the endpoint in the OTel setup block at the top of the file — see [Datadog OTLP endpoints](https://docs.datadoghq.com/opentelemetry/setup/otlp_ingest_in_the_agent/?tab=host).
+The instrumentation reads `DD_API_KEY` from the environment and exports to `https://otlp.datadoghq.com/v1/traces`.
 
 ### How it works
 
