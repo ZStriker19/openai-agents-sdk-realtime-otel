@@ -80,23 +80,25 @@ Talk into the mic. Press `Ctrl+C` to exit.
 
 The instrumented version of this file (`openai_agent_sdk_realtime.py`) sends GenAI traces to Datadog using OpenTelemetry. Each model turn becomes its own trace, and all turns share a `gen_ai.conversation.id` so Datadog groups them into a single conversation view.
 
-### Install OTel dependencies
-
-```bash
-uv add opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
-```
-
-> The audio instrumentation uses only Python standard library modules (`wave`, `io`, `base64`) — no additional packages required.
-
 ### Configure
 
-Add your Datadog API key to `.env`:
+Two things to fill in before running:
+
+**1. Datadog API key** — add to `.env`:
 
 ```
 DD_API_KEY=your-datadog-api-key
 ```
 
-The instrumentation reads `DD_API_KEY` from the environment and exports to `https://otlp.datadoghq.com/v1/traces`. Update the endpoint in the OTel setup block at the top of the file if you use the EU site or a different region.
+**2. Service name** — update the placeholder near the top of `openai_agent_sdk_realtime.py`:
+
+```python
+provider = TracerProvider(resource=Resource({SERVICE_NAME: "your-service-name"}))
+```
+
+Replace `"your-service-name"` with whatever you want to appear as the service in Datadog (e.g. `"my-voice-agent"`). This is how your traces are grouped in the LLM Observability UI.
+
+The instrumentation reads `DD_API_KEY` from the environment and exports to `https://otlp.datadoghq.com/v1/traces` (US1). If you're on a different Datadog site (EU, US3, etc.), update the endpoint in the OTel setup block at the top of the file — see [Datadog OTLP endpoints](https://docs.datadoghq.com/opentelemetry/setup/otlp_ingest_in_the_agent/?tab=host).
 
 ### How it works
 
